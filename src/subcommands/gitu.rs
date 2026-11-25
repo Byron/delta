@@ -162,7 +162,11 @@ fn tell_gitu_about_delta(config: &mut Config, opt: &crate::cli::Opt) {
         };
         enabled_features(&env, GitConfig::try_create(&env))
     });
-    renderer.git_config = RendererGitConfig::new(|dir| crate::git_config::open(Some(dir)).1);
+    // delta-gitu's theme picker and old-config check require a libgit2 config.
+    renderer.git_config = RendererGitConfig::new(|dir| match git2::Repository::discover(dir) {
+        Ok(repo) => repo.config().ok(),
+        Err(_) => git2::Config::open_default().ok(),
+    });
     renderer.options = RendererOptions::new(
         |dir, features, names| {
             let env = options_env(dir, features);
@@ -265,22 +269,20 @@ fn option_lists(
         .collect();
     let from_command_line =
         |feature: &&&str| opt.computed.command_line_features.contains(**feature);
-    let sections: Vec<String> = features
+    let sections: Vec<_> = features
         .iter()
         .filter(|feature| !from_command_line(feature))
         .chain(features.iter().filter(from_command_line))
-        .map(|feature| format!("delta.{feature}"))
-        .chain(["delta".to_owned()])
+        .map(|&feature| Some(feature))
+        .chain([None])
         .collect();
     names
         .iter()
         .map(|name| {
-            let mut items = vec![];
-            for section in &sections {
-                let regex = format!("^{}\\.{}$", regex::escape(section), regex::escape(name));
-                git_config.for_each(&regex, |_, value| items.extend(value.map(String::from)));
-            }
-            items
+            sections
+                .iter()
+                .flat_map(|&section| git_config.section_values(section, name))
+                .collect()
         })
         .collect()
 }
@@ -396,8 +398,7 @@ mod tests {
         color_mode(&options_with(git_config))
     }
 
-    /// gitu offers themes from the git config delta reads, so that a theme it offers is one delta
-    /// can find.
+    /// gitu offers themes from the repository's git config.
     #[test]
     fn test_gitu_reads_the_git_config_delta_reads() {
         let repo = std::env::temp_dir().join(format!(
@@ -405,12 +406,12 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let git_repo = git2::Repository::init(&repo).unwrap();
-        git_repo
-            .config()
-            .unwrap()
-            .set_bool("delta.mine.dark", true)
+        let git_repo = gix::init(&repo).unwrap();
+        let mut git_config = git_repo
+            .config_file_mut(git_repo.git_dir().join("config"))
             .unwrap();
+        git_config.set_raw_value("delta.mine.dark", "true").unwrap();
+        git_config.commit().unwrap();
 
         let mut config = configure("");
         tell_gitu_about_delta(&mut config, &options_with("[delta]\n"));
@@ -657,13 +658,13 @@ mod tests {
 
     #[test]
     fn test_gitu_is_told_a_lists_items_in_the_delta_section_and_each_feature_in_force() {
-        let git_config = "[delta]\n\tfeatures = a b\n\tcommand = x delta\n\
+        let git_config = "[delta]\n\tcommand\n\tfeatures = a b\n\tcommand = x delta\n\
                           [delta \"a\"]\n\tcommand = x a\n\tcommand = y a\n\
                           [delta \"b\"]\n\tcommand = x b\n\
                           [delta \"off\"]\n\tcommand = x off\n";
         assert_eq!(
             lists_with(git_config, None, &["command", "view"]),
-            [vec!["x a", "y a", "x b", "x delta"], vec![]]
+            [vec!["x a", "y a", "x b", "", "x delta"], vec![]]
         );
     }
 

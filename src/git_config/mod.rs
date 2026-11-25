@@ -4,6 +4,11 @@ pub use remote::GitRemoteRepo;
 
 use crate::cli;
 use crate::env::DeltaEnv;
+use gix::bstr::ByteSlice;
+use gix::config::{
+    file::{includes, init, Metadata},
+    File, Source,
+};
 use regex::Regex;
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -11,65 +16,66 @@ use std::path::Path;
 
 use lazy_static::lazy_static;
 
+#[cfg_attr(test, derive(Clone))]
 pub struct GitConfig {
-    config: git2::Config,
+    config: Config,
     config_from_env_var: HashMap<String, String>,
     pub enabled: bool,
-    repo: Option<git2::Repository>,
     remote_url: OnceCell<Option<GitRemoteRepo>>,
-    // To make GitConfig cloneable when testing (in turn to make Config cloneable):
-    #[cfg(test)]
-    path: std::path::PathBuf,
 }
 
-#[cfg(test)]
-impl Clone for GitConfig {
-    fn clone(&self) -> Self {
-        assert!(self.repo.is_none());
-        GitConfig {
-            // Assumes no test modifies the file pointed to by `path`
-            config: git2::Config::open(&self.path).unwrap(),
-            config_from_env_var: self.config_from_env_var.clone(),
-            enabled: self.enabled,
-            repo: None,
-            remote_url: OnceCell::new(),
-            path: self.path.clone(),
-        }
-    }
+#[cfg_attr(test, derive(Clone))]
+enum Config {
+    #[cfg(not(test))]
+    Repository(Box<gix::Repository>),
+    File(Box<File>),
 }
 
-/// The repository at or above `dir`, and the git config delta reads there: the repository's, or
-/// outside a repository the user's and the system's.
-pub fn open(dir: Option<&std::path::Path>) -> (Option<git2::Repository>, Option<git2::Config>) {
-    let repo = dir.and_then(|dir| git2::Repository::discover(dir).ok());
-    let config = match &repo {
-        Some(repo) => repo.config().ok(),
-        None => git2::Config::open_default().ok(),
+fn read_config(mut paths: impl Iterator<Item = Metadata>) -> gix::Result<File> {
+    let home = gix::path::env::home_dir();
+    let options = init::Options {
+        includes: includes::Options::follow_without_conditional(home.as_deref()),
+        lossy: true,
+        ..Default::default()
     };
-    (repo, config)
+    File::from_paths_metadata_buf(&mut paths, &mut Vec::new(), false, options)
+        .map(Option::unwrap_or_default)
+}
+
+#[cfg(not(test))]
+fn open(dir: Option<&Path>) -> Option<Config> {
+    let mut permissions = gix::open::Permissions::default();
+    // Delta handles the command-line overrides from its own environment snapshot.
+    permissions.config.env = false;
+    let options = gix::open::Options::default()
+        .permissions(permissions)
+        .bail_if_untrusted(true)
+        .lossy_config(true);
+    if let Some(repo) = dir.and_then(|dir| options.discover(dir).ok()) {
+        return Some(Config::Repository(Box::new(repo)));
+    }
+    // Match the configuration sources enabled when opening a repository.
+    let paths = [Source::System, Source::Git, Source::User]
+        .iter()
+        .filter_map(|&source| {
+            source
+                .storage_location(&mut gix::path::env::var)
+                .map(|path| Metadata::from(source).at(path))
+        });
+    read_config(paths)
+        .ok()
+        .map(|config| Config::File(Box::new(config)))
 }
 
 impl GitConfig {
     #[cfg(not(test))]
     pub fn try_create(env: &DeltaEnv) -> Option<Self> {
-        use crate::fatal;
-
-        let (repo, config) = open(env.current_dir.as_deref());
-        match config {
-            Some(mut config) => {
-                let config = config.snapshot().unwrap_or_else(|err| {
-                    fatal(format!("Failed to read git config: {err}"));
-                });
-                Some(Self {
-                    config,
-                    config_from_env_var: parse_config_from_env_var(env),
-                    repo,
-                    enabled: true,
-                    remote_url: OnceCell::new(),
-                })
-            }
-            None => None,
-        }
+        Some(Self {
+            config: open(env.current_dir.as_deref())?,
+            config_from_env_var: parse_config_from_env_var(env),
+            enabled: true,
+            remote_url: OnceCell::new(),
+        })
     }
 
     #[cfg(test)]
@@ -81,41 +87,35 @@ impl GitConfig {
     #[cfg(test)]
     pub fn for_testing() -> Option<Self> {
         Some(GitConfig {
-            config: git2::Config::new().unwrap(),
+            config: Config::File(Box::default()),
             config_from_env_var: HashMap::new(),
             enabled: true,
-            repo: None,
             remote_url: OnceCell::new(),
-            path: std::path::PathBuf::from("/invalid_null.git"),
         })
     }
 
     pub fn from_path(env: &DeltaEnv, path: &Path, honor_env_var: bool) -> Self {
         use crate::fatal;
 
-        match git2::Config::open(path) {
-            Ok(mut config) => {
-                let config = config.snapshot().unwrap_or_else(|err| {
-                    fatal(format!("Failed to read git config: {err}"));
-                });
+        let config = read_config(std::iter::once(Metadata::from(Source::Local).at(path)))
+            .unwrap_or_else(|err| fatal(format!("Failed to read git config: {err:#}")));
+        Self {
+            config: Config::File(Box::new(config)),
+            config_from_env_var: if honor_env_var {
+                parse_config_from_env_var(env)
+            } else {
+                HashMap::new()
+            },
+            enabled: true,
+            remote_url: OnceCell::new(),
+        }
+    }
 
-                Self {
-                    config,
-                    config_from_env_var: if honor_env_var {
-                        parse_config_from_env_var(env)
-                    } else {
-                        HashMap::new()
-                    },
-                    repo: None,
-                    enabled: true,
-                    remote_url: OnceCell::new(),
-                    #[cfg(test)]
-                    path: path.into(),
-                }
-            }
-            Err(e) => {
-                fatal(format!("Failed to read git config: {}", e.message()));
-            }
+    fn with_config<T>(&self, f: impl FnOnce(&File) -> T) -> T {
+        match &self.config {
+            #[cfg(not(test))]
+            Config::Repository(repo) => f(repo.config_snapshot().plumbing()),
+            Config::File(config) => f(config),
         }
     }
 
@@ -137,29 +137,46 @@ impl GitConfig {
 
     #[cfg(not(test))]
     fn get_remote_url_impl(&self) -> Option<GitRemoteRepo> {
-        use std::str::FromStr;
-        self.repo
-            .as_ref()?
-            .find_remote("origin")
-            .ok()?
-            .url()
-            .and_then(|url| GitRemoteRepo::from_str(url).ok())
+        let Config::Repository(repo) = &self.config else {
+            return None;
+        };
+        let remote = repo.find_remote("origin").ok()?;
+        let url = remote.url(gix::remote::Direction::Fetch)?.to_bstring();
+        url.to_str().ok()?.parse().ok()
     }
 
     pub fn get_remote_url(&self) -> &Option<GitRemoteRepo> {
         self.remote_url.get_or_init(|| self.get_remote_url_impl())
     }
 
-    pub fn for_each<F>(&self, regex: &str, mut f: F)
-    where
-        F: FnMut(&str, Option<&str>),
-    {
-        let mut entries = self.config.entries(Some(regex)).unwrap();
-        while let Some(entry) = entries.next() {
-            let entry = entry.unwrap();
-            let name = entry.name().unwrap();
-            f(name, entry.value());
-        }
+    pub fn theme_names(&self) -> Vec<String> {
+        self.with_config(|config| {
+            config
+                .sections_by_name("delta")
+                .into_iter()
+                .flatten()
+                .filter(|section| {
+                    section.contains_value_name("light") || section.contains_value_name("dark")
+                })
+                .filter_map(|section| {
+                    let name = section.header().subsection_name()?.to_str().ok()?;
+                    (!name.is_empty()).then(|| name.to_owned())
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(feature = "gitu")]
+    pub fn section_values(&self, subsection: Option<&str>, key: &str) -> Vec<String> {
+        let subsection = subsection.map(|name| name.as_bytes().as_bstr());
+        self.with_config(|config| {
+            config
+                .strings_by("delta", subsection, key)
+                .into_iter()
+                .flatten()
+                .filter_map(|value| String::from_utf8(value.into()).ok())
+                .collect()
+        })
     }
 }
 
@@ -217,20 +234,19 @@ impl GitConfigGet for String {
     fn git_config_get(key: &str, git_config: &GitConfig) -> Option<Self> {
         match git_config.config_from_env_var.get(key) {
             Some(val) => Some(val.to_string()),
-            None => git_config.config.get_string(key).ok(),
+            None => {
+                let value = git_config
+                    .with_config(|config| config.string_implicit(key))?
+                    .unwrap_or_default();
+                String::from_utf8(value.into()).ok()
+            }
         }
     }
 }
 
 impl GitConfigGet for Option<String> {
     fn git_config_get(key: &str, git_config: &GitConfig) -> Option<Self> {
-        match git_config.config_from_env_var.get(key) {
-            Some(val) => Some(Some(val.to_string())),
-            None => match git_config.config.get_string(key) {
-                Ok(val) => Some(Some(val)),
-                _ => None,
-            },
-        }
+        String::git_config_get(key, git_config).map(Some)
     }
 }
 
@@ -239,7 +255,7 @@ impl GitConfigGet for bool {
         match git_config.config_from_env_var.get(key).map(|s| s.as_str()) {
             Some("true") => Some(true),
             Some("false") => Some(false),
-            _ => git_config.config.get_bool(key).ok(),
+            _ => git_config.with_config(|config| config.boolean(key).ok().flatten()),
         }
     }
 }
@@ -249,11 +265,9 @@ impl GitConfigGet for cli::SideBySide {
         if let Some(Ok(value)) = git_config.config_from_env_var.get(key).map(|s| s.parse()) {
             return Some(value);
         }
-        let entry = git_config.config.get_entry(key).ok()?;
-        if entry.has_value() {
-            entry.value()?.parse().ok()
-        } else {
-            Some(Self::On(cli::SideBySideScope::All))
+        match git_config.with_config(|config| config.string_implicit(key))? {
+            Some(value) => value.to_str().ok()?.parse().ok(),
+            None => Some(Self::On(cli::SideBySideScope::All)),
         }
     }
 }
@@ -265,10 +279,9 @@ impl GitConfigGet for usize {
                 return Some(n);
             }
         }
-        match git_config.config.get_i64(key) {
-            Ok(value) => Some(value as usize),
-            _ => None,
-        }
+        git_config
+            .with_config(|config| config.integer(key).ok().flatten())
+            .map(|value| value as usize)
     }
 }
 
@@ -279,10 +292,12 @@ impl GitConfigGet for f64 {
                 return Some(n);
             }
         }
-        match git_config.config.get_string(key) {
-            Ok(value) => value.parse::<f64>().ok(),
-            _ => None,
-        }
+        git_config
+            .with_config(|config| config.string(key))?
+            .to_str()
+            .ok()?
+            .parse()
+            .ok()
     }
 }
 

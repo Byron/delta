@@ -56,21 +56,14 @@ where
     T::get_option_value(option_name, builtin_features, opt, git_config)
 }
 
-static GIT_CONFIG_THEME_REGEX: &str = r"^delta\.(.+)\.(light|dark)$";
-
 pub fn get_themes(git_config: Option<git_config::GitConfig>) -> Vec<String> {
     let mut themes: Vec<String> = Vec::new();
     let git_config = git_config.unwrap();
-    git_config.for_each(GIT_CONFIG_THEME_REGEX, |name, _| {
-        if let Some(name) = name.strip_prefix("delta.") {
-            if let Some((name, _)) = name.rsplit_once('.') {
-                let name = name.to_owned();
-                if !themes.contains(&name) {
-                    themes.push(name);
-                }
-            }
+    for name in git_config.theme_names() {
+        if !themes.contains(&name) {
+            themes.push(name);
         }
-    });
+    }
     themes.sort_by_key(|a| a.to_lowercase());
     themes
 }
@@ -395,6 +388,9 @@ pub mod tests {
 [delta "Uppercase-Theme"]
     light = true
 
+[Delta "theme.with.dot"]
+    DaRk
+
 [delta "not-a-theme"]
     max-line-distance = 0.6
 "#;
@@ -415,6 +411,7 @@ pub mod tests {
                 "dark-theme",
                 "light-and-dark-theme",
                 "light-theme",
+                "theme.with.dot",
                 "Uppercase-Theme"
             ]
         );

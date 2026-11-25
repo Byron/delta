@@ -40,7 +40,9 @@ console = "0.15.0"
 ctrlc = "3.2.5"
 delta-gitu = { version = "0.1.27", default-features = false, optional = true }
 dirs = "6.0.0"
-git2 = { version = "0.20.0", default-features = false, features = [] }
+# delta-gitu's renderer config callback returns a git2::Config.
+git2 = { version = "0.20.0", default-features = false, optional = true }
+gix = { version = "0.91.0", default-features = false, features = ["sha1"] }
 grep-cli = "0.1.8"
 itertools = "0.10.5"
 lazy_static = "1.4"
@@ -66,7 +68,7 @@ xdg = "2.4.1"
 [features]
 default = ["gitu"]
 # `delta tui`: an interactive git client and pager, with delta as its renderer.
-gitu = ["dep:delta-gitu", "dep:log", "dep:simple-logging"]
+gitu = ["dep:delta-gitu", "dep:git2", "dep:log", "dep:simple-logging"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tarpaulin_include)'] }
